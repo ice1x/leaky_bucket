@@ -1,54 +1,102 @@
-from time import time
+import threading
+import time
+from collections import deque
 
 
 class TokenBucket(object):
-    """An implementation of the token bucket algorithm.
+    def __init__(self, node, bitsPerSec, measIntv, LBtype):
+        self.node = node
+        self.bitsPerSec = bitsPerSec  # the rate limit
+        self.measIntv = measIntv  # the measure interval, tokens will become full at the beginning of each interval
+        self.LBtype = LBtype  # the type of the bucket
+        self.lastTime = 0  # the start time of the last measure interval
+        self.bitsDone = 0  # the bits that have been transmitted
+        self.BDLock = threading.Lock()  # the lock for the bits sent
+        self.packDQ = deque()  # the packet Q
+        self.maxToken = bitsPerSec * float(measIntv)  # the max token (bits)
+        self.token = self.maxToken  # the current token
+        self.condition = threading.Condition()  # sync lock
 
-    >>> bucket = TokenBucket(80, 0.5)
-    >>> print bucket.consume(10)
-    True
-    >>> print bucket.consume(90)
-    False
-    """
+    def packIn(self, msg):
+        """Insert a packet"""
+        self.condition.acquire()
+        self.packDQ.append(msg)
+        self.condition.notify()
+        self.condition.release()
 
-    def __init__(self, tokens, fill_rate):
-        """tokens is the total tokens in the bucket. fill_rate is the
-        rate in tokens/second that the bucket will be refilled."""
-        self.capacity = float(tokens)
-        self._tokens = float(tokens)
-        self.fill_rate = float(fill_rate)
-        self.timestamp = time()
+    def keepPoping(self):
+        """keep poping new pack"""
+        self.lastTime = time.time()  # record the start time
+        while True:
+            timeNow = time.time()
+            if timeNow - self.lastTime > self.measIntv:
+                # new intv, need to reset token
+                self.token = self.maxToken
+                self.lastTime = timeNow
+            self.condition.acquire()
+            if self.packDQ:  # the queue is not empty
+                pack = list(self.packDQ)[0]
+                packLen = len(pack[2]) * 8
+                if packLen > self.token:  # no enough token?
+                    # self.packDQ.popleft()
+                    self.condition.release()
+                    time.sleep(max(self.lastTime + self.measIntv - time.time(), 0))  # wait for enough token
+                else:  # enough token, can send out the packet
+                    self.packDQ.popleft()
+                    self.condition.release()
+                    self.changeBitsDone(packLen)
+                    self.token = self.token - packLen  # consume token
+            else:
+                self.condition.wait()
+                self.condition.release()
 
-    def consume(self, tokens):
-        """Consume tokens from the bucket. Returns True if there were
-        sufficient tokens otherwise False."""
-        if tokens <= self.tokens:
-            self._tokens -= tokens
-        else:
-            return False
-        return True
+    def begin(self):
+        """begin the leakybucket"""
+        aThread = threading.Thread(target=self.keepPoping, args=[])
+        aThread.start()
 
-    def get_tokens(self):
-        if self._tokens < self.capacity:
-            now = time()
-            delta = self.fill_rate * (now - self.timestamp)
-            self._tokens = min(self.capacity, self._tokens + delta)
-            self.timestamp = now
-        return self._tokens
+    def getBitsDone(self):
+        """get and reset bitsDone, for testing"""
+        self.BDLock.acquire()
+        reV = self.bitsDone
+        self.bitsDone = 0
+        self.BDLock.release()
+        return reV
 
-    tokens = property(get_tokens)
+    def changeBitsDone(self, length):
+        """change bitsDone, for testing"""
+        self.BDLock.acquire()
+        self.bitsDone += length
+        self.BDLock.release()
 
+    def measure(self, intv):
+        """measure the throughput of the leaky bucket"""
+        while True:
+            bitsDone = self.getBitsDone()
+            rate = bitsDone / float(intv * 1024)
+            print 'rate: %.2f' % rate
+            time.sleep(intv)
+
+    def startMeasure(self, intv):
+        """start measure the rate"""
+        # print 'here'
+        aThread = threading.Thread(target=self.measure, args=[intv])
+        aThread.start()
+
+
+def main():
+    pack = 1000*'a'
+    msg = ('192.168.1.1', 16000, pack)
+    print 'here'
+    LB = TokenBucket(None, 500*1024, 1, 'reg')
+    LB.begin()
+    LB.startMeasure(10)
+    numMsg = 0
+
+    while numMsg < 10000:
+        LB.packIn(msg)
+        print 'pack in'
+        numMsg += 1
 
 if __name__ == '__main__':
-    from time import sleep
-
-    bucket = TokenBucket(80, 1)
-    print "tokens =", bucket.tokens
-    print "consume(10) =", bucket.consume(10)
-    print "consume(10) =", bucket.consume(10)
-    sleep(1)
-    print "tokens =", bucket.tokens
-    sleep(1)
-    print "tokens =", bucket.tokens
-    print "consume(90) =", bucket.consume(90)
-    print "tokens =", bucket.tokens
+    main()
